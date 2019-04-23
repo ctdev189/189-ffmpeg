@@ -1,0 +1,9 @@
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=tool:libavformat 58.26.101
+m=video 5024 RTP/AVP/UDP 100
+c=IN IP4 127.0.0.1
+a=recvonly
+a=rtpmap:100 VP8/90000

@@ -1,0 +1,2 @@
+rtwm: rtwm.c
+	clang `pkg-config --cflags glib-2.0` `pkg-config --libs glib-2.0` -o rtwm.o rtwm.c ../monitor.c -I/usr/local/include -I/usr/local/include/glib -I/usr/local/include/glib/glib -lavcodec -lavutil -lavformat -lavfilter --debug\
