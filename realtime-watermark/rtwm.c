@@ -31,19 +31,16 @@ static AVStream *pStreamVideoOut;
 
 AVFilterContext *buffersink_ctx;
 AVFilterContext *buffersrc_ctx;
-AVFilterGraph *filter_graph;
-
-static gboolean decode_done;
-static gboolean filter_done;
-static gboolean encode_done;
 
 static GAsyncQueue *queue_decoded_frames, *queue_filtered_frames;
 
-static int decode();
-static int filter(AVFrame *pFrame);
-static int encode(AVFrame *pFrame, AVPacket *pPacket, int *iFrameIndex, int64_t *iStartTime);
+static gboolean decode_done, filter_done, encode_done;
+
+static void *input_to_decode_thread_handler(void *data);
 static void *decoded_to_filter_thread_handler(void *data);
 static void *filter_to_encode_thread_handler(void *data);
+static int filter(AVFrame *pFrame);
+static int encode(AVFrame *pFrame, AVPacket *pPacket, int *iFrameIndex, int64_t *iStartTime);
 
 static int open_input(const char *filename)
 {
@@ -98,13 +95,14 @@ static int open_input(const char *filename)
     return 0;
 }
 
-static int open_output(const char *out_filename)
+static int open_output(const char *filename)
 {
     int ret = 0;
 
-    avformat_alloc_output_context2(&pFmtCtxOut, NULL, "rtp", out_filename);
+    avformat_alloc_output_context2(&pFmtCtxOut, NULL, "rtp", filename);
+    av_opt_set_int(pFmtCtxOut->priv_data, "payload_type", 100, 0);
 
-    if (avio_open(&pFmtCtxOut->pb, out_filename, AVIO_FLAG_WRITE) < 0)
+    if (avio_open(&pFmtCtxOut->pb, filename, AVIO_FLAG_WRITE) < 0)
     {
         av_log(NULL, AV_LOG_ERROR, "Failed to open output file! \n");
         return ret;
@@ -157,17 +155,15 @@ static int open_output(const char *out_filename)
     }
 
     //Dump Output Format
-    av_dump_format(pFmtCtxOut, 0, out_filename, 1);
+    av_dump_format(pFmtCtxOut, 0, filename, 1);
 
     return 0;
 }
 
 static int init_filters(const char *watermark)
 {
-    const char *filter_descr = "movie=watermark.png[wm];[in][wm]overlay=1:1[out]";
-
-    char args[512];
     int ret;
+    char args[512], filters_descr[256];
     const AVFilter *buffersrc = avfilter_get_by_name("buffer");
     const AVFilter *buffersink = avfilter_get_by_name("buffersink");
     AVFilterInOut *outputs = avfilter_inout_alloc();
@@ -176,7 +172,7 @@ static int init_filters(const char *watermark)
     AVBufferSinkParams *buffersink_params;
     AVRational time_base = pFmtCtxIn->streams[iVideoStreamIndex]->time_base;
 
-    filter_graph = avfilter_graph_alloc();
+    AVFilterGraph *filter_graph = avfilter_graph_alloc();
 
     /* buffer video source: the decoded frames from the decoder will be inserted here. */
     snprintf(args, sizeof(args),
@@ -214,6 +210,8 @@ static int init_filters(const char *watermark)
     inputs->pad_idx = 0;
     inputs->next = NULL;
 
+    snprintf(filters_descr, sizeof(filters_descr), "movie=%s[wm];[in][wm]overlay=1:1[out]", watermark);
+
     if ((ret = avfilter_graph_parse_ptr(filter_graph, filters_descr, &inputs, &outputs, NULL)) < 0)
         return ret;
 
@@ -222,8 +220,25 @@ static int init_filters(const char *watermark)
 
     return 0;
 }
-/*解码收到的数据*/
-static int decode()
+
+/*从输入解码放到解码队列中*/
+static int new_input_to_decode_thread()
+{
+    queue_decoded_frames = g_async_queue_new(); //解码后的frame队列
+
+    GError *error = NULL;
+    g_thread_try_new("input2decode", input_to_decode_thread_handler, NULL, &error);
+    if (error != NULL)
+    {
+        av_log(NULL, AV_LOG_ERROR, "Got error %d (%s) trying to launch the \'input2decode\' thread.\n",
+               error->code, error->message ? error->message : "??");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void *input_to_decode_thread_handler(void *data)
 {
     int ret;
     AVPacket packet;
@@ -286,99 +301,27 @@ static int decode()
         av_packet_unref(&packet);
     }
 
+    avcodec_free_context(&pCodecCtxIn);
+    avformat_close_input(&pFmtCtxIn);
+
+    av_log(NULL, AV_LOG_INFO, "Stop input_to_decode_thread_handler loop.\n");
+
     /*结束从输入中解码*/
     decode_done = TRUE;
 
-    return 0;
-}
-/* 编码并输出 */
-static int encode(AVFrame *pFrame, AVPacket *pPacket, int *iFrameIndex, int64_t *iStartTime)
-{
-    int ret;
-
-    if (!pFrame)
-        return -1;
-
-    /* send the frame to the encoder */
-    dev189_monitor_timer_on(monitor, "encode");
-
-    dev189_monitor_timer_on(monitor, "send_frame");
-    ret = avcodec_send_frame(pCodecCtxOut, pFrame);
-    dev189_monitor_timer_off(monitor, "send_frame");
-
-    if (ret < 0)
-    {
-        dev189_monitor_timer_off(monitor, "encode");
-        av_log(NULL, AV_LOG_ERROR, "Error sending a frame for encoding\n");
-        return ret;
-    }
-
-    while (1)
-    {
-        dev189_monitor_timer_on(monitor, "receive_packet");
-        ret = avcodec_receive_packet(pCodecCtxOut, pPacket);
-        dev189_monitor_timer_off(monitor, "receive_packet");
-
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-        {
-            break;
-        }
-        else if (ret < 0)
-        {
-            dev189_monitor_timer_off(monitor, "encode");
-            av_log(NULL, AV_LOG_ERROR, "Error during encoding\n");
-            return ret;
-        }
-        //Convert PTS/DTS
-        if (pPacket->pts == AV_NOPTS_VALUE)
-        {
-            //Write PTS
-            AVRational time_base1 = pStreamVideoIn->time_base;
-            //Duration between 2 frames (us)
-            int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(pStreamVideoIn->r_frame_rate);
-            //Parameters
-            pPacket->pts = (double)(*iFrameIndex * calc_duration) / (double)(av_q2d(time_base1) * AV_TIME_BASE);
-            pPacket->dts = pPacket->pts;
-            pPacket->duration = (double)calc_duration / (double)(av_q2d(time_base1) * AV_TIME_BASE);
-        }
-        AVRational time_base = pStreamVideoIn->time_base;
-        AVRational time_base_q = {1, AV_TIME_BASE};
-        int64_t pts_time = av_rescale_q(pPacket->dts, time_base, time_base_q);
-        int64_t now_time = av_gettime() - *iStartTime;
-        if (pts_time > now_time)
-            av_usleep(pts_time - now_time);
-
-        pPacket->pts = av_rescale_q_rnd(pPacket->pts, pStreamVideoIn->time_base, pStreamVideoOut->time_base, (enum AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-        pPacket->dts = av_rescale_q_rnd(pPacket->dts, pStreamVideoIn->time_base, pStreamVideoOut->time_base, (enum AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-        pPacket->duration = av_rescale_q(pPacket->duration, pStreamVideoIn->time_base, pStreamVideoOut->time_base);
-        pPacket->pos = -1;
-
-        dev189_monitor_timer_on(monitor, "write_frame");
-        av_write_frame(pFmtCtxOut, pPacket);
-        dev189_monitor_timer_off(monitor, "write_frame");
-
-        (*iFrameIndex)++;
-        if (*iFrameIndex % 10 == 0)
-            av_log(NULL, AV_LOG_INFO, "Output frames: %d\n", *iFrameIndex);
-
-        av_packet_unref(pPacket);
-    }
-
-    dev189_monitor_timer_off(monitor, "encode");
-
-    return 0;
+    return NULL;
 }
 
 /*处理解码队列中的frame*/
 static int new_decode_to_filter_thread()
 {
-    queue_decoded_frames = g_async_queue_new(); //解码后的frame队列
+    //queue_decoded_frames = g_async_queue_new(); //解码后的frame队列
 
     GError *error = NULL;
     g_thread_try_new("decode2filter", decoded_to_filter_thread_handler, NULL, &error);
     if (error != NULL)
     {
-        av_log(NULL, AV_LOG_DEBUG, "Got error %d (%s) trying to launch the wait_decoded_thread...\n",
+        av_log(NULL, AV_LOG_ERROR, "Got error %d (%s) trying to launch the \'decode2filter\' thread.\n",
                error->code, error->message ? error->message : "??");
         return -1;
     }
@@ -421,9 +364,7 @@ static void *decoded_to_filter_thread_handler(void *data)
 
     return NULL;
 }
-/**
- * 给解码的frame加水印
- */
+/*给解码的frame加水印*/
 static int filter(AVFrame *pFrameDec)
 {
     int ret;
@@ -506,10 +447,91 @@ static void *filter_to_encode_thread_handler(void *data)
     //Write file trailer
     av_write_trailer(pFmtCtxOut);
 
+    av_log(NULL, AV_LOG_INFO, "Stop filter_to_encode_thread_handler loop.\n");
+
     encode_done = TRUE;
 
     return NULL;
 }
+
+/* 编码并输出 */
+static int encode(AVFrame *pFrame, AVPacket *pPacket, int *iFrameIndex, int64_t *iStartTime)
+{
+    int ret;
+
+    if (!pFrame)
+        return -1;
+
+    /* send the frame to the encoder */
+    dev189_monitor_timer_on(monitor, "encode");
+
+    dev189_monitor_timer_on(monitor, "send_frame");
+    ret = avcodec_send_frame(pCodecCtxOut, pFrame);
+    dev189_monitor_timer_off(monitor, "send_frame");
+
+    if (ret < 0)
+    {
+        dev189_monitor_timer_off(monitor, "encode");
+        av_log(NULL, AV_LOG_ERROR, "Error sending a frame for encoding\n");
+        return ret;
+    }
+
+    while (1)
+    {
+        dev189_monitor_timer_on(monitor, "receive_packet");
+        ret = avcodec_receive_packet(pCodecCtxOut, pPacket);
+        dev189_monitor_timer_off(monitor, "receive_packet");
+
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+        {
+            break;
+        }
+        else if (ret < 0)
+        {
+            dev189_monitor_timer_off(monitor, "encode");
+            av_log(NULL, AV_LOG_ERROR, "Error during encoding\n");
+            return ret;
+        }
+        //Convert PTS/DTS
+        if (pPacket->pts == AV_NOPTS_VALUE)
+        {
+            //Write PTS
+            AVRational time_base1 = pStreamVideoIn->time_base;
+            //Duration between 2 frames (us)
+            int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(pStreamVideoIn->r_frame_rate);
+            //Parameters
+            pPacket->pts = (double)(*iFrameIndex * calc_duration) / (double)(av_q2d(time_base1) * AV_TIME_BASE);
+            pPacket->dts = pPacket->pts;
+            pPacket->duration = (double)calc_duration / (double)(av_q2d(time_base1) * AV_TIME_BASE);
+        }
+        AVRational time_base = pStreamVideoIn->time_base;
+        AVRational time_base_q = {1, AV_TIME_BASE};
+        int64_t pts_time = av_rescale_q(pPacket->dts, time_base, time_base_q);
+        int64_t now_time = av_gettime() - *iStartTime;
+        if (pts_time > now_time)
+            av_usleep(pts_time - now_time);
+
+        pPacket->pts = av_rescale_q_rnd(pPacket->pts, pStreamVideoIn->time_base, pStreamVideoOut->time_base, (enum AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        pPacket->dts = av_rescale_q_rnd(pPacket->dts, pStreamVideoIn->time_base, pStreamVideoOut->time_base, (enum AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        pPacket->duration = av_rescale_q(pPacket->duration, pStreamVideoIn->time_base, pStreamVideoOut->time_base);
+        pPacket->pos = -1;
+
+        dev189_monitor_timer_on(monitor, "write_frame");
+        av_write_frame(pFmtCtxOut, pPacket);
+        dev189_monitor_timer_off(monitor, "write_frame");
+
+        (*iFrameIndex)++;
+        if (*iFrameIndex % 10 == 0)
+            av_log(NULL, AV_LOG_INFO, "Output frames: %d\n", *iFrameIndex);
+
+        av_packet_unref(pPacket);
+    }
+
+    dev189_monitor_timer_off(monitor, "encode");
+
+    return 0;
+}
+
 /**
  * shell执行
  * ./rtwm.o input.sdp rtp://127.0.0.1:5034 watermark.png
@@ -525,7 +547,7 @@ int main(int argc, char *argv[])
     }
     in_filename = argv[1];
     out_filename = argv[2];
-    watermark_filename = argv[2];
+    watermark_filename = argv[3];
 
     monitor = dev189_monitor_new();
     for (int i = 0; i < monitor_timer_LEN; i++)
@@ -546,6 +568,10 @@ int main(int argc, char *argv[])
     if (init_filters(watermark_filename) < 0)
         goto end;
 
+    /*接收输入并解码*/
+    if (new_input_to_decode_thread() < 0)
+        goto end;
+
     /*处理decoded队列*/
     if (new_decode_to_filter_thread() < 0)
         goto end;
@@ -554,15 +580,11 @@ int main(int argc, char *argv[])
     if (new_filter_to_encode_thread() < 0)
         goto end;
 
-    //av_log_set_level(AV_LOG_DEBUG);
-
-    /*开始解码*/
-    decode();
 end:
     // 等待处理完所有的frame
     while (!encode_done)
     {
-        av_log(NULL, AV_LOG_INFO, "Wait 1 second, %d frames in decoded queue, %d frames in decoded queue.\n", g_async_queue_length_unlocked(queue_decoded_frames), g_async_queue_length_unlocked(queue_filtered_frames));
+        av_log(NULL, AV_LOG_INFO, "Wait 2 second, %d frames in decoded queue, %d frames in filtered queue.\n", g_async_queue_length_unlocked(queue_decoded_frames), g_async_queue_length_unlocked(queue_filtered_frames));
         g_usleep(2 * G_USEC_PER_SEC);
     }
     //Output monitor
@@ -570,9 +592,6 @@ end:
     for (int i = 0; i < monitor_timer_LEN; i++)
         av_log(NULL, AV_LOG_INFO, "\t%s\n", dev189_monitor_timer_str(monitor, timers[i]));
     dev189_monitor_free(monitor);
-
-    avcodec_free_context(&pCodecCtxIn);
-    avformat_close_input(&pFmtCtxIn);
 
     return 0;
 }
