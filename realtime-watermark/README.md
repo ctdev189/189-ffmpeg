@@ -27,13 +27,16 @@ ffmpeg -re -stream_loop -1 -i vp8-320x240.webm -an -c:v copy -f rtp -payload_typ
 
 输出通过monitor显示了各个环节的执行时间
 ```
-timer=decode elapse=24583418(ms) / 24(s) times=612
-timer=filter elapse=171266(ms) / 0(s) times=611
-timer=encode elapse=26430301(ms) / 26(s) times=611
-timer=send_frame elapse=12678953(ms) / 12(s) times=611
-timer=receive_packet elapse=1697(ms) / 0(s) times=1222
-timer=write_frame elapse=74368(ms) / 0(s) times=611
-timer=usleep elapse=37795390(ms) / 37(s) times=44
+timer=open_input elapse=10256939(ms) / 10(s) times=1
+timer=open_output elapse=3455(ms) / 0(s) times=1
+timer=decode elapse=139412199(ms) / 139(s) times=366
+timer=read_frame elapse=138918873(ms) / 138(s) times=366
+timer=filter elapse=205528(ms) / 0(s) times=355
+timer=encode elapse=11660259(ms) / 11(s) times=355
+timer=send_frame elapse=11387272(ms) / 11(s) times=355
+timer=receive_packet elapse=952(ms) / 0(s) times=710
+timer=write_frame elapse=239639(ms) / 0(s) times=355
+timer=usleep elapse=154749807(ms) / 154(s) times=5849
 ```
 
 # 关键代码
