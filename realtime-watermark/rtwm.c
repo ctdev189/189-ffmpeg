@@ -582,11 +582,14 @@ int main(int argc, char *argv[])
 
 end:
     // 等待处理完所有的frame
-    while (!encode_done)
-    {
-        av_log(NULL, AV_LOG_INFO, "Wait 2 second, %d frames in decoded queue, %d frames in filtered queue.\n", g_async_queue_length_unlocked(queue_decoded_frames), g_async_queue_length_unlocked(queue_filtered_frames));
-        g_usleep(2 * G_USEC_PER_SEC);
-    }
+    // while (!encode_done)
+    // {
+    //     av_log(NULL, AV_LOG_INFO, "Wait 2 second, %d frames in decoded queue, %d frames in filtered queue.\n", g_async_queue_length_unlocked(queue_decoded_frames), g_async_queue_length_unlocked(queue_filtered_frames));
+    //     g_usleep(2 * G_USEC_PER_SEC);
+    // }
+    //按任意字符结束程序
+    av_log(NULL, AV_LOG_INFO, "按回车键结束！");
+    getchar();
     //Output monitor
     av_log(NULL, AV_LOG_INFO, "-----Monitor Info-----\n");
     for (int i = 0; i < monitor_timer_LEN; i++)
