@@ -19,8 +19,8 @@
 
 /*监控执行情况*/
 static t_dev189_monitor *monitor;
-#define monitor_timer_LEN 7
-const char *timers[monitor_timer_LEN] = {"decode", "filter", "encode", "send_frame", "receive_packet", "write_frame", "usleep"};
+#define monitor_timer_LEN 10
+const char *timers[monitor_timer_LEN] = {"open_input", "open_output", "decode", "read_frame", "filter", "encode", "send_frame", "receive_packet", "write_frame", "usleep"};
 
 static AVFormatContext *pFmtCtxIn = NULL, *pFmtCtxOut = NULL;
 static int iVideoStreamIndex = -1;
@@ -240,6 +240,8 @@ static int new_input_to_decode_thread()
 
 static void *input_to_decode_thread_handler(void *data)
 {
+    av_log(NULL, AV_LOG_INFO, "Start input_to_decode_thread_handler loop.\n");
+
     int ret;
     AVPacket packet;
     AVFrame *pFrame, *pFrameDec;
@@ -251,9 +253,14 @@ static void *input_to_decode_thread_handler(void *data)
     while (1)
     {
         dev189_monitor_timer_on(monitor, "decode");
+        dev189_monitor_timer_on(monitor, "read_frame");
         //Get an AVPacket
         if ((ret = av_read_frame(pFmtCtxIn, &packet)) < 0)
+        {
+            dev189_monitor_timer_off(monitor, "read_frame");
             break;
+        }
+        dev189_monitor_timer_off(monitor, "read_frame");
         //Only video stream
         if (packet.stream_index != iVideoStreamIndex)
             continue;
@@ -331,6 +338,8 @@ static int new_decode_to_filter_thread()
 
 static void *decoded_to_filter_thread_handler(void *data)
 {
+    av_log(NULL, AV_LOG_INFO, "Start decoded_to_filter_thread_handler loop.\n");
+
     AVFrame *pFrameDec;
 
     /*从解码队列中提取frame，加滤镜，并放入队列等待后续处理*/
@@ -415,6 +424,8 @@ static int new_filter_to_encode_thread()
 
 static void *filter_to_encode_thread_handler(void *data)
 {
+    av_log(NULL, AV_LOG_INFO, "Start filter_to_encode_thread_handler loop.\n");
+
     AVFrame *pFrameFil;
     AVPacket *pPacketNew = av_packet_alloc();
     int64_t iStartTime = av_gettime();
@@ -557,12 +568,16 @@ int main(int argc, char *argv[])
     avformat_network_init();
 
     /*Input*/
+    dev189_monitor_timer_on(monitor, "open_input");
     if (open_input(in_filename) < 0)
         goto end;
+    dev189_monitor_timer_off(monitor, "open_input");
 
     /*Output*/
+    dev189_monitor_timer_on(monitor, "open_output");
     if (open_output(out_filename) < 0)
         goto end;
+    dev189_monitor_timer_off(monitor, "open_output");
 
     /*Watermark*/
     if (init_filters(watermark_filename) < 0)
@@ -581,14 +596,8 @@ int main(int argc, char *argv[])
         goto end;
 
 end:
-    // 等待处理完所有的frame
-    // while (!encode_done)
-    // {
-    //     av_log(NULL, AV_LOG_INFO, "Wait 2 second, %d frames in decoded queue, %d frames in filtered queue.\n", g_async_queue_length_unlocked(queue_decoded_frames), g_async_queue_length_unlocked(queue_filtered_frames));
-    //     g_usleep(2 * G_USEC_PER_SEC);
-    // }
     //按任意字符结束程序
-    av_log(NULL, AV_LOG_INFO, "按回车键结束！");
+    av_log(NULL, AV_LOG_INFO, "-----按回车键结束！-----\n");
     getchar();
     //Output monitor
     av_log(NULL, AV_LOG_INFO, "-----Monitor Info-----\n");

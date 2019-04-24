@@ -14,10 +14,27 @@ ffmpeg从输入端获得视频流，解码（decode）后传递给滤镜（filte
 
 # 运行
 shell命令
+
+启动一个输入视频流，注意必须是vp8，320x240（可使用asset目录中的文件）
+```
+ffmpeg -re -stream_loop -1 -i vp8-320x240.webm -an -c:v copy -f rtp -payload_type 100 rtp://127.0.0.1:5024
+```
+
+启动程序，需要指定输入，输出和水印文件
 ```
 ./rtwm.o input.sdp rtp://127.0.0.1:5034 watermark.png
 ```
-输出
+
+输出通过monitor显示了各个环节的执行时间
+```
+timer=decode elapse=24583418(ms) / 24(s) times=612
+timer=filter elapse=171266(ms) / 0(s) times=611
+timer=encode elapse=26430301(ms) / 26(s) times=611
+timer=send_frame elapse=12678953(ms) / 12(s) times=611
+timer=receive_packet elapse=1697(ms) / 0(s) times=1222
+timer=write_frame elapse=74368(ms) / 0(s) times=611
+timer=usleep elapse=37795390(ms) / 37(s) times=44
+```
 
 # 关键代码
 ## 接收SDP文件作为输入
