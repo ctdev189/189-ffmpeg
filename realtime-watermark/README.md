@@ -46,6 +46,20 @@ avformat_open_input(&pFmtCtxIn, filename, 0, 0);
 ```
 必须设置protocol_whitelist属性为"file,udp,rtp"才能用sdp文件作为输入。另外，应该用av_opt_set设置属性，而不是直接用等于，否则释放资源时会报指针错误。
 
+## 从输入流读帧超时
+```
+if ((ret = av_read_frame(pFmtCtxIn, &packet)) < 0)
+{
+    if (AVERROR(ETIMEDOUT) == ret)
+    {
+        av_log(NULL, AV_LOG_WARNING, "input2decode thread av_read_frame timeout.\n");
+        continue;
+    }
+    break;
+}
+```
+如果程序启动时，还没有产生输入流，av_read_frame函数读不到内容就会超时，超时的时间是10秒（通过monitor可以观察到）。分析ffmpeg代码，发现最终调用了rtsp.c文件中udp_read_packet，该方法中每100毫秒取一次数据，共尝试100次，所以10秒内没有获得数据就会返回超时。
+
 ## 设置输出流的deadline属性
 ```
 //realtime|good|best

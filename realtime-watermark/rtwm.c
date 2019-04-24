@@ -34,7 +34,7 @@ AVFilterContext *buffersrc_ctx;
 
 static GAsyncQueue *queue_decoded_frames, *queue_filtered_frames;
 
-static gboolean decode_done, filter_done, encode_done;
+static gboolean main_done, decode_done, filter_done, encode_done;
 
 static void *input_to_decode_thread_handler(void *data);
 static void *decoded_to_filter_thread_handler(void *data);
@@ -49,7 +49,8 @@ static int open_input(const char *filename)
     pFmtCtxIn = avformat_alloc_context();
     pFmtCtxIn->iformat = av_find_input_format("sdp");
     av_opt_set(pFmtCtxIn, "protocol_whitelist", "file,udp,rtp", 0);
-    av_opt_set(pFmtCtxIn, "max_analyze_duration", 0, 0);
+    av_opt_set_int(pFmtCtxIn, "max_delay", 7 * 1000000, 0);
+    av_opt_set_int(pFmtCtxIn, "max_analyze_duration", 0, 0);
 
     if ((ret = avformat_open_input(&pFmtCtxIn, filename, 0, 0)) < 0)
     {
@@ -250,14 +251,20 @@ static void *input_to_decode_thread_handler(void *data)
     /**
      * 从输入中解码（decode）frame，放入队列，等待后续处理
      */
-    while (1)
+    while (!main_done)
     {
         dev189_monitor_timer_on(monitor, "decode");
         dev189_monitor_timer_on(monitor, "read_frame");
         //Get an AVPacket
         if ((ret = av_read_frame(pFmtCtxIn, &packet)) < 0)
         {
-            dev189_monitor_timer_off(monitor, "read_frame");
+            if (AVERROR(ETIMEDOUT) == ret)
+            {
+                dev189_monitor_timer_off(monitor, "read_frame");
+                dev189_monitor_timer_off(monitor, "decode");
+                av_log(NULL, AV_LOG_WARNING, "input2decode thread av_read_frame timeout.\n");
+                continue;
+            }
             break;
         }
         dev189_monitor_timer_off(monitor, "read_frame");
@@ -343,23 +350,15 @@ static void *decoded_to_filter_thread_handler(void *data)
     AVFrame *pFrameDec;
 
     /*从解码队列中提取frame，加滤镜，并放入队列等待后续处理*/
-    while (1)
+    while (!decode_done)
     {
         pFrameDec = g_async_queue_try_pop(queue_decoded_frames);
-        if (pFrameDec == NULL)
+        if (NULL == pFrameDec)
         {
-            if (decode_done)
-            {
-                break;
-            }
-            else
-            {
-                //av_log(NULL, AV_LOG_INFO, "Wait other frames.\n");
-                dev189_monitor_timer_on(monitor, "usleep");
-                g_usleep(G_USEC_PER_SEC);
-                dev189_monitor_timer_off(monitor, "usleep");
-                continue;
-            }
+            dev189_monitor_timer_on(monitor, "usleep");
+            g_usleep(1000);
+            dev189_monitor_timer_off(monitor, "usleep");
+            continue;
         }
 
         filter(pFrameDec);
@@ -431,22 +430,15 @@ static void *filter_to_encode_thread_handler(void *data)
     int64_t iStartTime = av_gettime();
     int iFrameIndex = 0;
 
-    while (1)
+    while (!filter_done)
     {
         pFrameFil = g_async_queue_try_pop(queue_filtered_frames);
         if (pFrameFil == NULL)
         {
-            if (filter_done)
-            {
-                break;
-            }
-            else
-            {
-                dev189_monitor_timer_on(monitor, "usleep");
-                g_usleep(G_USEC_PER_SEC);
-                dev189_monitor_timer_off(monitor, "usleep");
-                continue;
-            }
+            dev189_monitor_timer_on(monitor, "usleep");
+            g_usleep(1000);
+            dev189_monitor_timer_off(monitor, "usleep");
+            continue;
         }
 
         encode(pFrameFil, pPacketNew, &iFrameIndex, &iStartTime);
@@ -596,9 +588,16 @@ int main(int argc, char *argv[])
         goto end;
 
 end:
-    //按任意字符结束程序
     av_log(NULL, AV_LOG_INFO, "-----按回车键结束！-----\n");
     getchar();
+
+    /*依次线程结束*/
+    main_done = TRUE;
+    while (!decode_done || !filter_done || !encode_done)
+    {
+        g_usleep(1000);
+    }
+
     //Output monitor
     av_log(NULL, AV_LOG_INFO, "-----Monitor Info-----\n");
     for (int i = 0; i < monitor_timer_LEN; i++)
